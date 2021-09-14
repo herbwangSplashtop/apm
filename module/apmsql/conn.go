@@ -213,9 +213,11 @@ type connBeginTx struct {
 
 func (c *connBeginTx) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	// TODO(axw) instrument commit/rollback?
-	tx :=    c.connBeginTx.BeginTx(ctx, opts),
+	tx, err := c.connBeginTx.BeginTx(ctx, opts)
 
-	t := newTx(tx, c.conn)
-
-	return t
+	if err == nil {
+		t := newTx(tx, c.conn)
+		return t, nil
+	}
+	return nil, err
 }
