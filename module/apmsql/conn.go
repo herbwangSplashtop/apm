@@ -59,6 +59,9 @@ type conn struct {
 	execer             driver.Execer
 	execerContext      driver.ExecerContext
 	connBeginTx        driver.ConnBeginTx
+
+	BeginTxTransaction *apm.Transaction
+	BeginTxSpanCtx     context.Context
 }
 
 func (c *conn) startStmtSpan(ctx context.Context, stmt, spanType string) (*apm.Span, context.Context) {
@@ -130,11 +133,18 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if c.queryerContext == nil && c.queryer == nil {
 		return nil, driver.ErrSkip
 	}
-	span, ctx := c.startStmtSpan(ctx, query, c.driver.querySpanType)
+
+	cctx := ctx
+
+	if c.BeginTxSpanCtx != nil {
+		cctx = c.BeginTxSpanCtx
+	}
+
+	span, ctx := c.startStmtSpan(cctx, query, c.driver.querySpanType)
 	defer c.finishSpan(ctx, span, nil, &resultError)
 
 	if c.queryerContext != nil {
-		return c.queryerContext.QueryContext(ctx, query, args)
+		return c.queryerContext.QueryContext(cctx, query, args)
 	}
 	dargs, err := namedValueToValue(args)
 	if err != nil {
@@ -153,12 +163,17 @@ func (*conn) Query(query string, args []driver.Value) (driver.Rows, error) {
 }
 
 func (c *conn) PrepareContext(ctx context.Context, query string) (_ driver.Stmt, resultError error) {
-	span, ctx := c.startStmtSpan(ctx, query, c.driver.prepareSpanType)
+	cctx := ctx
+
+	if c.BeginTxSpanCtx != nil {
+		cctx = c.BeginTxSpanCtx
+	}
+	span, ctx := c.startStmtSpan(cctx, query, c.driver.prepareSpanType)
 	defer c.finishSpan(ctx, span, nil, &resultError)
 	var stmt driver.Stmt
 	var err error
 	if c.connPrepareContext != nil {
-		stmt, err = c.connPrepareContext.PrepareContext(ctx, query)
+		stmt, err = c.connPrepareContext.PrepareContext(cctx, query)
 	} else {
 		stmt, err = c.Prepare(query)
 		if err == nil {
@@ -180,11 +195,18 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if c.execerContext == nil && c.execer == nil {
 		return nil, driver.ErrSkip
 	}
-	span, ctx := c.startStmtSpan(ctx, query, c.driver.execSpanType)
+
+	cctx := ctx
+
+	if c.BeginTxSpanCtx != nil {
+		cctx = c.BeginTxSpanCtx
+	}
+
+	span, ctx := c.startStmtSpan(cctx, query, c.driver.execSpanType)
 	defer c.finishSpan(ctx, span, &result, &resultError)
 
 	if c.execerContext != nil {
-		return c.execerContext.ExecContext(ctx, query, args)
+		return c.execerContext.ExecContext(cctx, query, args)
 	}
 	dargs, err := namedValueToValue(args)
 	if err != nil {
@@ -214,10 +236,65 @@ type connBeginTx struct {
 func (c *connBeginTx) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	// TODO(axw) instrument commit/rollback?
 	tx, err := c.connBeginTx.BeginTx(ctx, opts)
-
-	if err == nil {
-		t := newTx(tx, c.conn)
-		return t, nil
+	if err != nil {
+		return nil, err
 	}
-	return nil, err
+
+	transaction := apm.DefaultTracer.StartTransaction("beginTx", "beginTx")
+	c.conn.BeginTxSpanCtx = apm.ContextWithTransaction(ctx, transaction)
+	c.conn.BeginTxTransaction = transaction
+
+	t := newTx(tx, c.conn)
+
+	return t, nil
+}
+
+func newTx(in driver.Tx, conn *conn) driver.Tx {
+	tx := &tx{
+		Tx:   in,
+		conn: conn,
+	}
+	tx.connPrepareContext = conn.connPrepareContext
+	return tx
+}
+
+type tx struct {
+	*conn
+	driver.Tx
+
+	connPrepareContext driver.ConnPrepareContext
+}
+
+func (t *tx) Commit() error {
+	err := t.Tx.Commit()
+
+	cctx := t.conn.BeginTxSpanCtx
+
+	var resultError error
+
+	span, ctx := t.conn.startStmtSpan(cctx, "Commit", t.conn.driver.querySpanType)
+	defer t.conn.finishSpan(ctx, span, nil, &resultError)
+
+	t.conn.BeginTxTransaction.Result = "Commit"
+	t.conn.BeginTxTransaction.End()
+	t.conn.BeginTxTransaction = nil
+	t.conn.BeginTxSpanCtx = nil
+	return err
+}
+
+func (t *tx) Rollback() error {
+	err := t.Tx.Rollback()
+
+	cctx := t.conn.BeginTxSpanCtx
+
+	var resultError error
+
+	span, ctx := t.conn.startStmtSpan(cctx, "Rollback", t.conn.driver.querySpanType)
+	defer t.conn.finishSpan(ctx, span, nil, &resultError)
+
+	t.conn.BeginTxTransaction.Result = "Rollback"
+	t.conn.BeginTxTransaction.End()
+	t.conn.BeginTxTransaction = nil
+	t.conn.BeginTxSpanCtx = nil
+	return err
 }
