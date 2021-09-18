@@ -62,6 +62,7 @@ type conn struct {
 
 	BeginTxTransaction *apm.Transaction
 	BeginTxSpanCtx     context.Context
+	ExternalTx         bool
 }
 
 func (c *conn) startStmtSpan(ctx context.Context, stmt, spanType string) (*apm.Span, context.Context) {
@@ -240,7 +241,15 @@ func (c *connBeginTx) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 		return nil, err
 	}
 
-	transaction := apm.DefaultTracer.StartTransaction("beginTx", "beginTx")
+	transaction := apm.TransactionFromContext(ctx)
+
+	if transaction != nil {
+		c.conn.ExternalTx = true
+	} else {
+		c.conn.ExternalTx = false
+		transaction = apm.DefaultTracer.StartTransaction("beginTx", "beginTx")
+	}
+
 	c.conn.BeginTxSpanCtx = apm.ContextWithTransaction(ctx, transaction)
 	c.conn.BeginTxTransaction = transaction
 
@@ -275,8 +284,10 @@ func (t *tx) Commit() error {
 	span, ctx := t.conn.startStmtSpan(cctx, "Commit", t.conn.driver.querySpanType)
 	defer t.conn.finishSpan(ctx, span, nil, &resultError)
 
-	t.conn.BeginTxTransaction.Result = "Commit"
-	t.conn.BeginTxTransaction.End()
+	if !t.conn.ExternalTx {
+		t.conn.BeginTxTransaction.Result = "Commit"
+		t.conn.BeginTxTransaction.End()
+	}
 	t.conn.BeginTxTransaction = nil
 	t.conn.BeginTxSpanCtx = nil
 	return err
@@ -292,8 +303,10 @@ func (t *tx) Rollback() error {
 	span, ctx := t.conn.startStmtSpan(cctx, "Rollback", t.conn.driver.querySpanType)
 	defer t.conn.finishSpan(ctx, span, nil, &resultError)
 
-	t.conn.BeginTxTransaction.Result = "Rollback"
-	t.conn.BeginTxTransaction.End()
+	if !t.conn.ExternalTx {
+		t.conn.BeginTxTransaction.Result = "Rollback"
+		t.conn.BeginTxTransaction.End()
+	}
 	t.conn.BeginTxTransaction = nil
 	t.conn.BeginTxSpanCtx = nil
 	return err
